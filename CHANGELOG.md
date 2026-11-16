@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.2.0-rc.1](https://github.com/huangsizhou/Hookshot-refine/compare/v2.1.0...v2.2.0-rc.1) (2026-11-16)
+
+
+### Features
+
+* **hid:** Switch 2 Pro Controller over USB on Windows ([3578aa1](https://github.com/huangsizhou/Hookshot-refine/commit/3578aa15af3544bedac6cd6eabf1683f035f69c4))
+
+
+### Bug Fixes
+
+* **hid:** Switch 2 Pro Controller: turn its motion sensors on again when they have not started ([c823c20](https://github.com/huangsizhou/Hookshot-refine/commit/c823c209afbc16bb27742df95490a4c5a5d82127))
+
+
+### Performance Improvements
+
+* **vk:** parallel replay on by default, with its GPU waits cut ([5ce403d](https://github.com/huangsizhou/Hookshot-refine/commit/5ce403defcd9dbe175d940713e79038cf37b3854))
+
+
+### Documentation
+
+* **readme:** introduce Hookshot-refine ([96ea272](https://github.com/huangsizhou/Hookshot-refine/commit/96ea272c90fd750de1365509ad5c351d5e831fd3))
+
 ## [2.1.0](https://github.com/NotRexed/Hookshot/releases/tag/v2.1.0) (2026-11-11)
 
 Release candidate [v2.1.0-rc.2](https://github.com/NotRexed/Hookshot/releases/tag/v2.1.0-rc.2), published as 2.1.0. Its changes are in its release candidates' entries below.
