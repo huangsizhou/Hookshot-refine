@@ -1400,15 +1400,32 @@ void maybe_split(VkCommandBuffer& cmd) {
 }
 
 // ---- parallel replay: the threads and a command buffer's segments ----
-// (RX_VK_PARALLEL=<threads recording a command buffer, the replay thread one of them>; 0, 1: off, the default. Segments
+// (RX_VK_PARALLEL=<threads that record a command buffer's segments>; 0, 1: off. Segments
 // recorded out of order left one-frame black scenes in play, 48-93 in a walk through Kakariko against none on the
 // replay thread alone, at about the same frame rate here: 36-40 fps against 38-41)
 // (hookshot) One cause of those is gone: the dry pass did not mark the targets of a clear (NOP_CLEAR_COLOR in replay()). With
 // that, Castle Town's market and eight other places showed no black frame on 3 to 8 threads; the Kakariko walk was not run
-// again, so it stays off. On a 9950X3D the replay's wall time in the market goes from 10.9 ms a frame to 7.75 on 3 threads.
+// again. On a 9950X3D the replay's wall time in the market goes from 10.9 ms a frame to 7.75 on 3 threads.
 int par_threads() {
-    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL")) : 0, 0, 8);
+    // (hookshot) on by default with three threads where the PC has 12 logical processors or more: the game's six cores, the
+    // replay's and these. Measured on 16 (Ryzen 7 5800X, RTX 5070 Ti, 3840x2160, Kokiri Forest, ~2450 draws): by itself it
+    // gained little or lost (the game then waited for the GPU instead, seg_writebacks below); with the segments' own
+    // write-backs, the smaller segments and the captures' buffers in the card's memory, 62 fps against 52, and 74 against 72
+    // at ~750 draws. No flash in the frame log there, standing; only Kokiri Forest was run, and not the Kakariko walk above:
+    // RX_VK_PARALLEL=0 where a place shows black frames
+    static const int n = std::clamp(getenv("RX_VK_PARALLEL") ? atoi(getenv("RX_VK_PARALLEL"))
+                                    : std::thread::hardware_concurrency() >= 12 ? 3 : 0, 0, 8);
     return n;
+}
+/// (hookshot) A segment's write-backs at its own end, and its submit on the recordings' timeline as a part of the submission
+/// (part_rec), as a serial replay's parts are (maybe_split). They were all copied back by the recording after the last
+/// segment, so a readback of what the first segment wrote (invalidate) and a capture's late pages waited for the GPU to
+/// finish the whole command buffer: with the segments recorded faster than the GPU runs them, the game's job threads stood
+/// 0.3-0.4 ms at each of ~25 readbacks a frame (0.06 ms serial), and three recording threads were slower than two
+/// (RTX 5070 Ti, 3840x2160, Kokiri Forest: 50 against 55 fps). RX_VK_PARALLEL_SEG_WB=0: after the last segment, as before
+bool seg_writebacks() {
+    static const bool v = !getenv("RX_VK_PARALLEL_SEG_WB") || atoi(getenv("RX_VK_PARALLEL_SEG_WB")) != 0;
+    return v;
 }
 struct ParPool {
     std::mutex mu;
@@ -1519,8 +1536,12 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     dry_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dry0).count();
     // (segments of ~RX_VK_PARALLEL_SEG draws and dispatches (default 160), taken in order by the threads and submitted
     // as each is done with those before it: the GPU starts on the first while the rest are recorded)
-    static const int64_t per = getenv("RX_VK_PARALLEL_SEG") ? std::max(32, atoi(getenv("RX_VK_PARALLEL_SEG"))) : 160;
-    const int nseg = (int)std::clamp<int64_t>(total / per, 1, kMaxBatch);
+    // (hookshot: ~80, in 12 segments at most, were ~160 in 6: the first segment is at the GPU twice as soon, and the GPU's
+    // frame, not the recording, is what the game then waits for: 57 -> 59.5 fps)
+    static const int64_t per = getenv("RX_VK_PARALLEL_SEG") ? std::max(32, atoi(getenv("RX_VK_PARALLEL_SEG"))) : 80;
+    // (RX_VK_PARALLEL_SEGS=<n>: at most that many segments a command buffer, 12 by default, 14 at most)
+    static const int max_segs = std::clamp(getenv("RX_VK_PARALLEL_SEGS") ? atoi(getenv("RX_VK_PARALLEL_SEGS")) : 2 * kMaxBatch, 1, 14);
+    const int nseg = (int)std::clamp<int64_t>(total / per, 1, max_segs);
     std::vector<Segment> seg;
     seg.push_back({h, nullptr, &start, ub0, 0});
     for (int k = 1; k < nseg; k++) {
@@ -1547,6 +1568,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // command buffer and uploads), recorded in order by the threads and submitted in order as they are done
     Recording& r = *rec_cur;
     end_pass(r.cmd);
+    // (hookshot) and what the recording before the segments wrote is copied back in it, as its own part. It was left for
+    // the recording after the last segment: OoT's exposure meter (15 KB, written by the submission's first command buffers,
+    // read back by the game every frame) was then waited for until the GPU had run every segment, 4.5 ms a frame at the
+    // chest in Kokiri Forest (~750 draws), which made the parallel replay slower there than the serial one (59 against 72 fps)
+    if (seg_writebacks()) memory_segment_end(r.cmd, r.part, UINT64_MAX);
     full_barrier(r.cmd);
     memory_sync_mirrors_before_segments();   // (in r's uploads, ahead of every segment)
     submit_recording(r, false);
@@ -1558,6 +1584,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         Recording* r;
         Segment g;
         uint64_t order;
+        uint64_t part = 0;   // (its number among the recordings begun: seg_writebacks)
         int index = 0;
         std::atomic<bool> done{false};
         bool uploads = false;
@@ -1567,6 +1594,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     for (size_t k = 0; k < seg.size(); k++) {
         auto j = std::make_unique<Job>();
         j->r = &begin_segment_recording(rec_cur_value);
+        j->part = rec_part_next;
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandPool(dev.device, j->r->upload_pool, 0);
@@ -1625,7 +1653,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
                 j->inits = texture_segment_end(j->index);   // (after its last new image)
                 texture_segment_worker(-1);
                 vkEndCommandBuffer(j->r->upload);
-                vkEndCommandBuffer(j->r->cmd);
+                // (its command buffer is ended at its submit, after its write-backs: seg_writebacks)
                 {
                     std::lock_guard l(seg_mu);
                     j->done = true;
@@ -1645,6 +1673,8 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
         if (j->inits < 0) init_lost = true;   // (its init command buffer could not be ended: the replay stops, below)
         if (init_lost) continue;              // (nothing from it on is submitted)
+        if (seg_writebacks()) memory_segment_end(j->r->cmd, j->part, j->order);
+        vkEndCommandBuffer(j->r->cmd);
         draw_flush_recording(j->r->slot);
         VkCommandBufferSubmitInfo cb[3]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
                                         {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
@@ -1655,6 +1685,18 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = n;
         si.pCommandBufferInfos = cb;
+        VkSemaphoreSubmitInfo part_done{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        if (seg_writebacks() && rec_timeline) {   // (found by its part, as submit_recording's; replay_mu held: in order)
+            part_done.semaphore = rec_timeline;
+            part_done.value = ++rec_seq;
+            part_done.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            si.signalSemaphoreInfoCount = 1;
+            si.pSignalSemaphoreInfos = &part_done;
+            std::lock_guard mk(rec_map_mu);
+            part_rec.emplace_hint(part_rec.end(), j->part, part_done.value);
+            while (part_rec.size() > 8192) part_rec.erase(part_rec.begin());
+            rec_map_cv.notify_all();
+        }
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made; after the flush, which tags its own)
@@ -2504,7 +2546,16 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (size) {
         static const bool off = env_on("RX_VK_NO_READBACK_WAIT");
         bool ever = false;
-        if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
+        // (hookshot) A readback of a range larger than RX_VK_READBACK_WAIT_MAX_KB (64) is not waited for. OoT's job threads
+        // read ~25 ranges back a frame; the ones that waited were the large ones (112 KB, 570-635 KB, 4.4 MB: lists the GPU
+        // writes late in the frame and the game reads the frame after, 2-4 ms each for the GPU to end its frame), while the
+        // range the wait is for, the 15 KB exposure meter the CPU also writes, never waited more than a fraction of a
+        // millisecond. Those waits put the game's next frame behind the GPU's whole frame: with the replay recorded on three
+        // threads, 3840x2160, an RTX 5070 Ti, Kokiri Forest went from 52 to 57 fps without them, with no flash in the frame
+        // log. The game reads what the GPU has written so far, as on the console when the GPU is late. 0: every range waits
+        static const uint64_t wait_max =
+            (uint64_t)(getenv("RX_VK_READBACK_WAIT_MAX_KB") ? std::max(0ll, atoll(getenv("RX_VK_READBACK_WAIT_MAX_KB"))) : 64) << 10;
+        if (!off && !(wait_max && size > wait_max) && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();

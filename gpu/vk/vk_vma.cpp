@@ -281,6 +281,29 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     if (mapped) *mapped = info.pMappedData;
     return true;
 }
+/// (hookshot) A buffer in the card's own memory that the CPU can write (device-local and host-visible: the card's BAR), mapped:
+/// what the CPU copies into it is in VRAM already, and a GPU copy out of it does not cross the bus. Write-combined: read back
+/// slowly. False where the card has no such memory type or no room in it
+bool create_buffer_device_mapped(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
+                                 void** mapped, bool dedicated) {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = usage;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_UNKNOWN;
+    ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    ai.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+    if (mapped) *mapped = info.pMappedData;
+    if (!info.pMappedData) {
+        vmaDestroyBuffer(vma, buffer, allocation);
+        buffer = VK_NULL_HANDLE, allocation = nullptr;
+        return false;
+    }
+    return true;
+}
 bool host_cached(VmaAllocation allocation) {
     VkMemoryPropertyFlags f = 0;
     if (allocation) vmaGetAllocationMemoryProperties(vma, allocation, &f);

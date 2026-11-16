@@ -1046,6 +1046,26 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     }
     size = cap_buf_size(need);
     map = nullptr;
+    // (hookshot) The captures' buffers in the card's own memory where it has a type the CPU can write (device-local and
+    // host-visible: the BAR). A capture's pages went into host memory and the GPU copied them to the mirrors from there, over
+    // the bus: the "msync copies", 3.4 ms of the GPU's time a frame for 20 MB (RTX 5070 Ti, Kokiri Forest, RX_VK_PASS_TIMING),
+    // 2.1 ms from the card's memory; and the copy on the game's thread is a write-combined one, 0.30 ms a submit against
+    // 0.44. Such a buffer is read back slowly: the texture pages the shadow reads are staged in ordinary memory first, as on
+    // the cards whose only host-visible memory is this kind (c->buf_cached, capture_make). A buffer that does not fit there
+    // (a 256 MB BAR) is made in host memory as before. RX_VK_CAP_DEVICE=0: all in host memory
+    static const bool cap_device = !getenv("RX_VK_CAP_DEVICE") || atoi(getenv("RX_VK_CAP_DEVICE")) != 0;
+    if (cap_device) {
+        static std::atomic<int> made{0}, missed{0};
+        if (create_buffer_device_mapped(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
+                                        size >= (16ull << 20) && !env_on("RX_VK_CAP_BLOCKS")) && map) {
+            if (made++ == 0) logf("vk: capture buffers in the card's own CPU-writable memory (RX_VK_CAP_DEVICE=0: in host memory)");
+            return true;
+        }
+        if (missed++ < 4)
+            logf("vk: a capture buffer of %llu KB did not fit the card's CPU-writable memory: in host memory",
+                 (unsigned long long)(size >> 10));
+        map = nullptr;
+    }
     return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
                                 size >= (16ull << 20) && !env_on("RX_VK_CAP_BLOCKS")) && map;
 }
@@ -1078,9 +1098,24 @@ void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
     if (!capture_pool_max()) return;
     const uint32_t g = host->maps_generation();
     if (g == pool_cap_gen && captures_made - pool_cap_built < 64) return;   // (and every 64: the old ones out)
-    pool_cap_gen = g, pool_cap_built = captures_made;
+    const bool due = captures_made - pool_cap_built >= 64;
+    pool_cap_gen = g;
     static std::vector<std::array<uint64_t, 2>> list(8192);
     const int n = host->gpu_pools(reinterpret_cast<uint64_t(*)[2]>(list.data()), (int)list.size());
+    // (hookshot) The mappings change every frame in play (maps_generation) while the pools mostly stay: the same list of
+    // pools gives the same ranges, and building them again (a hash table and a sort of ~1200 pools) and saying they changed
+    // (cap_ranges_ver: every capture's union of the three lists sorted again) was 0.2 ms a frame of the game's main thread
+    // and as much of the presenting thread's. Still built every 64 captures, and whenever the eager captures count
+    {
+        static uint64_t last_hash = 0;
+        static int last_n = -1;
+        uint64_t h = 1469598103934665603ull;
+        for (int i = 0; i < n; i++) h = ((h ^ list[i][0]) * 1099511628211ull ^ list[i][1]) * 1099511628211ull;
+        const bool same = n == last_n && h == last_hash;
+        last_hash = h, last_n = n;
+        if (same && !due && !eager_captures()) return;
+    }
+    pool_cap_built = captures_made;
     std::vector<std::pair<uint64_t, uint64_t>> v;
     std::unordered_map<uint64_t, uint64_t> seen;
     seen.reserve((size_t)std::max(n, 0));
@@ -1642,7 +1677,10 @@ int capture_copy_helpers() {   // (copy_pages and copy_pairs share one pool of h
 /// queued before them (copy_pairs runs with pools_mu and shadow_mu held, copy_pages' guest copies can take milliseconds)
 void copy_split(CopyPart whole, int64_t n) {
     const int helpers = capture_copy_helpers();
-    if (!helpers || n < 128) { whole.i0 = 0, whole.i1 = n; return copy_part(whole); }
+    // (hookshot: from 1024 copies (4 MB), was 128. A helper asleep takes 50-100 us to run and a capture of a few hundred
+    // pages is copied in less: the submitting thread copied it all anyway and then waited for the helpers it had woken
+    // (0.2 ms a frame of the main thread's). The frame's one large capture, ~5000 pages, still goes to them)
+    if (!helpers || n < 1024) { whole.i0 = 0, whole.i1 = n; return copy_part(whole); }
     const int k = helpers + 1;
     int left = k - 1;
     auto part = [&](int i) {
@@ -2471,8 +2509,10 @@ std::vector<Pool*> mirror_wanted, mirror_synced;
 struct WriteBack {
     Pool* pool;
     uint64_t lo, hi;   // offsets in the pool
+    uint64_t seg;      // (the parallel replay's segment that wrote it, texture_segment(): memory_segment_end)
 };
 std::vector<WriteBack> writebacks;
+const uint64_t* wb_only_seg = nullptr;   // (memory_segment_end: only that segment's write-backs; the replaying thread's)
 // (hookshot, 11-07) The counter reports the replay writes into guest memory on the CPU (vk_replay.cpp NOP_REPORT_COUNTER), by
 // guest address: a mirrored pool's write-back copied the GPU's mirror over them at the end of the submission, the mirror's
 // stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
@@ -3076,7 +3116,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
             return kb << 10;
         }();
         if (!wb_max || size <= wb_max)
-            writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
+            writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo), texture_segment()});
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
     }
     return remember({p->mirror, off, size, 0});
@@ -3919,7 +3959,7 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
     std::lock_guard lk(pools_mu);
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
         static int64_t n, l_live, l_cap;
-        if (++n % 600 == 0) {
+        if (!wb_only_seg && ++n % 600 == 0) {
             static int64_t l_old;
             logf("vk: mirror syncs (600 submits): %lld dirty pages from their submits' captures, %lld from earlier ones', "
                  "%lld from guest memory as it was at the replay; %zu captures kept; %lld pages the GPU wrote copied over "
@@ -3989,6 +4029,15 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
     }
     static const bool no_writeback = env_on("RX_VK_NO_WRITEBACK");   // (an experiment: none)
     if (no_writeback) writebacks.clear();
+    // (a segment's: the others' kept for their own ends, or for the end of the recording after them all)
+    static std::vector<WriteBack> wb_rest;
+    wb_rest.clear();
+    if (wb_only_seg) {
+        const auto mid = std::stable_partition(writebacks.begin(), writebacks.end(),
+                                               [](const WriteBack& w) { return *wb_only_seg == UINT64_MAX || w.seg == *wb_only_seg; });
+        wb_rest.assign(mid, writebacks.end());
+        writebacks.erase(mid, writebacks.end());
+    }
     if (!writebacks.empty()) {
         // per pool, the ranges merged, one copy each (mirror -> the guest's pool)
         std::sort(writebacks.begin(), writebacks.end(), [](const WriteBack& a, const WriteBack& b) {
@@ -4136,11 +4185,21 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
         transfer_barrier(cmd);
         writebacks.clear();
     }
+    if (wb_only_seg) {
+        writebacks.swap(wb_rest);
+        return;
+    }
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
     // in the mirror and written back; CPU writes collected at the next submission get a newer generation)
     for (Pool* p : mirror_synced) p->synced_gen = gen_now;
     mirror_synced.clear();
     mirror_upload = false;
+}
+
+void memory_segment_end(VkCommandBuffer cmd, uint64_t part, uint64_t seg) {
+    wb_only_seg = &seg;
+    memory_end_submission(cmd, part);
+    wb_only_seg = nullptr;
 }
 
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {

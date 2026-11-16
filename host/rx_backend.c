@@ -79,6 +79,19 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
         uint64_t p1 = (hi + 4095) >> 12;
         if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
         for (uint64_t p = lo >> 12; p < p1;) {
+            /* (hookshot) 256 pages at a time while none is marked: the ranges are gigabytes (the mappings merged across
+               gaps of up to 16 MB) and a submit writes a few hundred pages of them, so the scan is nearly all clean spans.
+               32 pages a step was 0.5 ms a frame of the game's main thread at its submits (HOS_CHAIN + HOS_SAMPLE_ALL,
+               Kokiri Forest) and as much on the presenting thread, before the GPU has anything of the frame */
+            if (!(p & 255) && p + 256 <= p1) {
+                uint64_t w[32], any = 0;
+                memcpy(w, &a64_dirty[p], 256);
+                for (int k = 0; k < 32; k++) any |= w[k];
+                if (!any) {
+                    p += 256;
+                    continue;
+                }
+            }
             if (!(p & 31) && p + 32 <= p1) {   /* (32 pages at a time while none is marked) */
                 uint64_t w[4];
                 memcpy(w, &a64_dirty[p], 32);

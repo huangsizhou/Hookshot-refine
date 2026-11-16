@@ -169,6 +169,10 @@ bool probe_serial();
 void probe_dump_all(const char* why);
 void probe_log(uint64_t frame);
 void memory_end_submission(VkCommandBuffer cmd, uint64_t part = 0);   // (part: the recording cmd is, for the pages it writes back)
+/// (hookshot) A parallel replay's segment `seg` (texture_segment's number), recorded: what it wrote is copied back at the end
+/// of its own command buffer, noted as part `part`, as a serial replay's part does (vk_replay.cpp replay_handle).
+/// seg UINT64_MAX: every write-back queued so far (the recording before the segments)
+void memory_segment_end(VkCommandBuffer cmd, uint64_t part, uint64_t seg);
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
@@ -240,6 +244,8 @@ uint64_t memory_capture_view();          // (bumped when a capture is published 
 uint32_t memory_page_stamp(uint64_t gpu); // (that address's page only)
 uint64_t gpu_pool_end(uint64_t gpu);   // (hookshot) where the memory pool holding that address ends, 0: in none (vk_memory.cpp)
 uint64_t gpu_pool_start(uint64_t gpu); // (EvilOOT) and where it begins
+bool create_buffer_device_mapped(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
+                                 void** mapped, bool dedicated = false);   // (vk_vma.cpp: the card's own memory, CPU-writable)
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
                           void** mapped, bool dedicated = false);   // (vk_vma.cpp: cached host memory, mapped)
 void flush_mapped(VmaAllocation allocation, uint64_t size);

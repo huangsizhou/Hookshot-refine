@@ -40,6 +40,7 @@ struct HosThread {
        whether it has run without one since an escape (vc_acquire; until its next block, hos_vcore_away, or the next
        hos_vcore_back) */
     int vc_held, vc_last, vc_queued, vc_escaped;
+    int vc_first;   /* (the thread that presents: first in line for a core, hos_vcore_presenter) */
     volatile int vc_kick;
     int64_t vc_since;
     CONDITION_VARIABLE vc_cv;
@@ -1483,8 +1484,25 @@ static unsigned vc_allowed(HosThread *t) {
     if (!m) m = 1u << hos_thread_core(t);
     return m;
 }
+/* (hookshot) The thread that presents is first in line for a core, whatever its priority, and a holder gives it one at its
+   next checkpoint. It wakes once a frame to hand the frame's commands to the renderer, runs a few guest instructions and
+   gives its core up for the replay (nvnQueueSubmitCommands): it waited ~0.6 ms a frame for a core behind the job threads
+   (HOS_CHAIN, Kokiri Forest), and the GPU has nothing of the frame until it runs. One thread a core at a time still holds.
+   HOS_VCORE_PRESENTER=0: by its priority, as before */
+static int vc_presenter_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_VCORE_PRESENTER");
+        on = e ? atoi(e) != 0 : 1;
+    }
+    return on;
+}
+void hos_vcore_presenter(void) {
+    if (cur && !cur->vc_first && vc_presenter_on()) cur->vc_first = 1;
+}
 /* a runs before b */
 static int vc_better(HosThread *a, HosThread *b) {
+    if (a->vc_first != b->vc_first) return a->vc_first;
     return a->priority != b->priority ? a->priority < b->priority : a->vc_since < b->vc_since;
 }
 /* a free core t may run on (its last one, its ideal one, then the lowest), or -1; holding vc_lock */
@@ -1539,11 +1557,17 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
     return (e ? atoll(e) : us) * 1000;
 }
 static void vc_acquire(HosThread *t) {
-    static int64_t esc_better = -1, esc_eq, slice;
+    static int64_t esc_better = -1, esc_eq, slice, spin;
     if (esc_better < 0) {
         esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 2000000);
-        esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 2000000);
         slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
+        /* (hookshot) A waiter looks for its core for HOS_VCORE_SPIN_US (25) before it sleeps on its condition variable. The
+           game's threads wait for a core ~160 times a frame, 53 us each on average (the "vcores:" line, Kokiri Forest): a
+           wait that short was mostly the sleep's own wake-up, tens of microseconds on Windows, and those waits are on the
+           frame's path (HOS_VCORES=0, which the game's per-core data does not allow, was 2.6 fps faster at 60). 0: it
+           sleeps at once, as before */
+        spin = vc_env_ns("HOS_VCORE_SPIN_US", 25);
+        esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 2000000);
     }
     AcquireSRWLockExclusive(&vc_lock);
     vc_st.takes++;
@@ -1559,7 +1583,7 @@ static void vc_acquire(HosThread *t) {
     t->vc_queued = 1;
     if (vc_nq < 1024) vc_queue[vc_nq++] = t;
     vc_st.waits++;
-    for (;;) {
+    for (int first = 1;; first = 0) {
         /* the worst holder worse than t on a core t may use gives it up at its next checkpoint; after
            HOS_VCORE_SLICE_US (2000) of waiting, a holder as good as t does too (a time slice: Horizon would leave
            it running, but its threads never run two at once on one core, which the game's per-core data needs). The
@@ -1568,16 +1592,24 @@ static void vc_acquire(HosThread *t) {
         HosThread *worst = NULL;
         for (int k = 0; k < vc_cores(); k++) {
             HosThread *h = vc_owner[k];
-            if ((m >> k & 1) && h && h->priority > t->priority && (!worst || h->priority > worst->priority)) worst = h;
+            if ((m >> k & 1) && h && (h->priority > t->priority || (t->vc_first && !h->vc_first)) &&
+                (!worst || h->priority > worst->priority)) worst = h;
         }
         if (!worst && hos_now_ns() - t0 > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
         if (worst && !worst->vc_kick) {
-            worst->vc_kick = worst->priority > t->priority ? 1 : 2;
+            worst->vc_kick = worst->priority > t->priority || t->vc_first ? 1 : 2;
             Ctx *rc = worst->run_ctx;   /* (a fiber's context while it runs one) */
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
+        }
+        if (first && spin > 0) {   /* (a core granted while it looks: taken without the sleep) */
+            ReleaseSRWLockExclusive(&vc_lock);
+            const int64_t s0 = hos_now_ns();
+            while (!__atomic_load_n(&t->vc_held, __ATOMIC_RELAXED) && hos_now_ns() - s0 < spin) YieldProcessor();
+            AcquireSRWLockExclusive(&vc_lock);
+            if (t->vc_held) break;
         }
         SleepConditionVariableSRW(&t->vc_cv, &vc_lock, 1, 0);
         if (t->vc_held) break;   /* granted by a release */
@@ -1631,7 +1663,8 @@ static void vc_yield(HosThread *t, int strict) {
     int any = 0;
     for (int i = 0; i < vc_nq && !any; i++) {
         HosThread *w = vc_queue[i];
-        any = (vc_allowed(w) >> c & 1) && (strict ? w->priority < t->priority : w->priority <= t->priority);
+        any = (vc_allowed(w) >> c & 1) &&
+              ((w->vc_first && !t->vc_first) || (strict ? w->priority < t->priority : w->priority <= t->priority));
     }
     t->vc_kick = 0;
     if (any) vc_st.yields++;
@@ -1694,6 +1727,7 @@ int hos_vcores_on(void) { return 0; }
 int hos_vcore_away(void) { return 0; }
 void hos_vcore_back(void) {}
 void hos_vcore_checkpoint(void) {}
+void hos_vcore_presenter(void) {}
 void hos_vcore_yield(void) {}
 int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
     return SleepConditionVariableSRW((PCONDITION_VARIABLE)cv, (PSRWLOCK)lk, ms, 0);

@@ -25,6 +25,12 @@
   <a href="#license">License</a>
 </p>
 
+> [!NOTE]
+> **This is a fork** of [NotRexed/Hookshot](https://github.com/NotRexed/Hookshot) with changes for the frame rate on
+> Windows (about +9 fps at 3840x2160 in the heaviest scene measured, on one PC). What was changed, what was measured and
+> what was not tested: [docs/fork-performance.md](docs/fork-performance.md). Releases, the builder and support are
+> upstream's.
+
 Hookshot is a static recompilation. The game's code is translated to C and compiled into a Windows or Linux program,
 the console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
 **on your PC, from your own copy of the game**.
