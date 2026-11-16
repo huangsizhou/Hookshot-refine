@@ -568,6 +568,14 @@ anything SDL reports as a Switch Pro Controller or Joy-Con, and that includes th
 (8BitDo, GameSir and others; SDL gives them Nintendo's ids). Some of them may turn it into weak rumble or none: set
 `HOS_HD_RUMBLE=0` to give them the plain motor rumble.
 
+**Switch 2 Pro Controller over USB (Windows):** plug it in with a USB cable and it works as any other controller: its
+buttons, both sticks, ZL and ZR, the GL and GR buttons on its back, the capture button, its gyroscope for Motion controls
+and its rumble (on its motors). Nothing to install: Windows binds the part of the controller that starts it to its own
+WinUSB driver by itself, and the game starts it and reads it through Windows (SDL's Windows library has no driver for it).
+The C button does nothing. Bluetooth, the Joy-Con 2 and the GameCube controller for Switch 2 are not supported. If Steam
+is running with its own Switch 2 support, it may hold the controller: the game's log then says
+`hid: Switch 2 Pro Controller (USB) found, but another program has it`. `HOS_SWITCH2=0` leaves it to Steam or anything else.
+
 To change which gamepad button or key presses a Switch button, or which keys move and turn the camera, open the
 Controls tab's Controls page. Choose a row and a column (Gamepad or Keyboard), press <kbd>Enter</kbd> (or the bottom
 face button), then the new button or key. <kbd>Esc</kbd> cancels, <kbd>Delete</kbd> clears it, and Reset to defaults
