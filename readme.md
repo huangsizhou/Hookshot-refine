@@ -26,10 +26,24 @@
 </p>
 
 > [!NOTE]
-> **This is a fork** of [NotRexed/Hookshot](https://github.com/NotRexed/Hookshot) with changes for the frame rate on
-> Windows (about +9 fps at 3840x2160 in the heaviest scene measured, on one PC). What was changed, what was measured and
-> what was not tested: [docs/fork-performance.md](docs/fork-performance.md). Releases, the builder and support are
-> upstream's.
+> **Hookshot-refine** is Hookshot (NotRexed's project, from its source at `51da046`) with two additions:
+>
+> - **Frame rate on Windows:** the replay of the game's GPU work is recorded on several threads, the game no longer waits
+>   for the GPU's whole frame when it reads results back, and the captures go straight to the card's memory. About +9 fps
+>   at 3840x2160 in the heaviest scene measured (52.7 to 61.7 fps), +5 to +9 in other places, on one PC (Ryzen 7 5800X,
+>   RTX 5070 Ti). Each change can be turned off. Details, measurements and what was not tested:
+>   [docs/fork-performance.md](docs/fork-performance.md).
+> - **Switch 2 Pro Controller over USB (Windows):** buttons, sticks, triggers, motion controls and rumble, with nothing to
+>   install. See [Switch 2 Pro Controller over USB](#controls) under Controls.
+>
+> This repository has no releases or builder of its own: build the game from source as
+> [Build from source](#build-from-source) describes. The links to releases, Discord and issues below are the original
+> project's.
+>
+> **中文简介：** 本仓库基于 Hookshot（NotRexed 的项目，源码 `51da046`），新增两项改进：Windows 上的帧率优化（多线程录制
+> GPU 命令、读取 GPU 结果时不再等整帧、捕获数据直接写入显存；4K 最重测试场景约 +9 帧，其它场景 +5 到 +9，均可单独关闭，
+> 详见 [docs/fork-performance.md](docs/fork-performance.md)），以及 Switch 2 Pro 手柄 USB 连接支持（按键、摇杆、扳机、
+> 体感、震动，无需安装驱动）。本仓库不提供发布包和构建器，请按 [Build from source](#build-from-source) 从源码构建。
 
 Hookshot is a static recompilation. The game's code is translated to C and compiled into a Windows or Linux program,
 the console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
