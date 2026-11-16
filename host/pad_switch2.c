@@ -70,6 +70,9 @@ typedef struct {
     uint32_t first_ts, last_ts;
     float gyro_coeff, accel[3], gyro[3];
     int have_motion;
+    int64_t opened_ns, ts_moved_ns, rearm_ns;   /* (its start; the last time its sensors' clock moved; the next re-arm) */
+    int rearms;
+    uint8_t imu_raw[18];                        /* (the sensors' bytes of the last report, for the log) */
     uint16_t rumble_lo, rumble_hi;
     int64_t rumble_next;
     uint32_t rumble_seq;
@@ -409,6 +412,8 @@ static void parse(Sw2 *d, const uint8_t *r) {
     /* motion (SDL's HandleStatePacket): the sensors' clock is microseconds on most, something else on some; the
        gyroscope's full scale follows which, measured over the first hundred readings */
     const uint32_t ts = (uint32_t)(r[0x2b] | r[0x2c] << 8 | r[0x2d] << 16 | (uint32_t)r[0x2e] << 24);
+    memcpy(d->imu_raw, r + 0x2b, sizeof d->imu_raw);
+    if (ts && ts != d->last_ts) d->ts_moved_ns = hos_now_ns();
     if (!ts) return;
     d->last_ts = ts;
     if (!d->ready) {
@@ -474,19 +479,51 @@ static void rumble_send(Sw2 *d, int64_t now) {
     d->rumble_next = d->rumble_lo || d->rumble_hi ? now + 12000000 : 0;
 }
 
+/* (hookshot) Its motion sensors, on again when their clock has not moved. The start sequence turns them on once (the features'
+   mask 0x27, bit 0x04 the sensors) and its replies are not looked at: in one start of the game (Windows 11, after the
+   controller had been started by an earlier run without being unplugged) the buttons and sticks came and the sensors'
+   clock stayed still for the six minutes it was plugged in, so motion never started. The mask and the enable are sent again
+   1.5 s after the start, then every 3 s, five times at most, each said in the log with the sensors' bytes */
+static void imu_rearm(Sw2 *d, int64_t now) {
+    if (d->ready && d->ts_moved_ns && now - d->ts_moved_ns > 1000000000LL) {   /* (they ran, then stopped: the same again) */
+        hos_log("hid: Switch 2 Pro Controller: its motion sensors stopped");
+        d->ready = 0, d->have_motion = 0, d->rearms = 0, d->rearm_ns = 0;
+    }
+    if (d->ready || d->rearms >= 5 || now - d->opened_ns < 1500000000LL || now < d->rearm_ns) return;
+    if (d->ts_moved_ns && now - d->ts_moved_ns < 500000000LL) return;   /* (moving: still measuring its clock) */
+    static const uint8_t mask[] = {0x0c, 0x91, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00};
+    static const uint8_t on[] = {0x0c, 0x91, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x27, 0x00, 0x00, 0x00};
+    uint8_t reply[0x40], r1[0x40] = {0};
+    int n1 = -1, n2 = -1;
+    if (bulk_send(d, mask, sizeof mask) >= 0) n1 = bulk_recv(d, r1, sizeof r1);
+    if (bulk_send(d, on, sizeof on) >= 0) n2 = bulk_recv(d, reply, sizeof reply);
+    d->rearms++;
+    d->rearm_ns = now + 3000000000LL;
+    d->samples = 0, d->first_ts = 0;
+    char hex[3 * 18 + 1], rhex[3 * 12 + 1];
+    for (int i = 0; i < 18; i++) snprintf(hex + 3 * i, 4, "%02x ", d->imu_raw[i]);
+    for (int i = 0; i < 12; i++) snprintf(rhex + 3 * i, 4, "%02x ", n2 > i ? reply[i] : 0);
+    hos_log("hid: Switch 2 Pro Controller: its motion sensors have not started: turned on again (%d of 5; replies %d and %d "
+            "bytes: %s; sensors' bytes %s)", d->rearms, n1, n2, rhex, hex);
+}
+
 static void poll_pad(Sw2 *d) {
     for (int guard = 0; guard < 256; guard++) {
         DWORD n = 0;
         if (!d->reading) {
             ResetEvent(d->rov.hEvent);
             if (!ReadFile(d->hid, d->rbuf, d->in_len, NULL, &d->rov) && GetLastError() != ERROR_IO_PENDING) {
+                hos_log("hid: Switch 2 Pro Controller: its reports stopped (error %lu): unplugged?", GetLastError());
                 d->gone = 1;
                 return;
             }
             d->reading = 1;
         }
         if (!GetOverlappedResult(d->hid, &d->rov, &n, FALSE)) {
-            if (GetLastError() != ERROR_IO_INCOMPLETE) d->gone = 1;
+            if (GetLastError() != ERROR_IO_INCOMPLETE) {
+                hos_log("hid: Switch 2 Pro Controller: its reports stopped (error %lu): unplugged?", GetLastError());
+                d->gone = 1;
+            }
             return;
         }
         d->reading = 0;
@@ -540,6 +577,7 @@ void *hos_switch2_open(int what) {
     d->buttons = 0;
     memset(d->axes, 0, sizeof d->axes);
     d->samples = d->ready = 0, d->first_ts = d->last_ts = 0, d->gyro_coeff = 34.8f, d->have_motion = 0;
+    d->opened_ns = hos_now_ns(), d->ts_moved_ns = 0, d->rearm_ns = 0, d->rearms = 0;
     d->rumble_lo = d->rumble_hi = 0, d->rumble_next = 0, d->rumble_dirty = 0, d->reports = 0;
     snprintf(d->name, sizeof d->name, "Nintendo Switch 2 Pro Controller");
     hos_log("hid: Switch 2 Pro Controller started over USB in %.0f ms (WinUSB endpoints %#x/%#x, reports %lu bytes, "
@@ -567,6 +605,7 @@ void hos_switch2_update(void) {
         if (!d->open || d->gone) continue;
         poll_pad(d);
         if (!d->gone) rumble_send(d, now);
+        if (!d->gone) imu_rearm(d, now);
     }
 }
 
